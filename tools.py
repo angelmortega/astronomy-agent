@@ -1,10 +1,13 @@
 """The tools the harness can run, and the JSON that describes them to the model."""
 
 import json
+import math
 import re
+import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
@@ -15,6 +18,26 @@ FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 # NASA JPL Horizons is free and needs no API key.
 HORIZONS_URL = "https://ssd.jpl.nasa.gov/api/horizons.api"
+
+# Every US place with a light pollution score, built by build_db.py.
+LIGHT_POLLUTION_DB = Path(__file__).parent / "light_pollution.db"
+
+# Places this dark or darker show the Milky Way clearly.
+DARK_SKY_SCORE = 4
+
+# What a beginner can expect to see at each score.
+SKY_BY_SCORE = {
+    1: "Pristine dark sky. The Milky Way is bright enough to cast detail, and thousands of stars are visible.",
+    2: "Excellent dark sky. The Milky Way is bright and detailed.",
+    3: "Rural sky. The Milky Way is clearly visible.",
+    4: "Rural sky with some glow on the horizon. The Milky Way is clearly visible overhead.",
+    5: "Rural to suburban. City glow is about as bright as the natural sky; the Milky Way is visible but washed out low down.",
+    6: "Suburban sky. The Milky Way is faint, only overhead on the best nights.",
+    7: "Bright suburban sky. The Milky Way is hard to see. Bright star clusters still work.",
+    8: "Urban sky. No Milky Way. Stick to the Moon, planets, bright stars and bright clusters.",
+    9: "City sky. Only the brightest stars. The Moon and planets still look great; faint galaxies and nebulae are washed out.",
+    10: "Inner-city sky, among the brightest in the country. The Moon and planets are the targets here.",
+}
 
 # Horizons IDs for the bodies a beginner cares about most.
 MAJOR_BODIES = {
@@ -64,33 +87,80 @@ def geocode(location: str) -> dict:
     }
 
 
-def get_weather(location: str) -> str:
-    """Get the current weather for a location."""
+def _rate_hour(clouds: float, rain_chance: float, wind_mph: float) -> str:
+    """How good one hour is for a beginner with a small telescope."""
+    if rain_chance >= 40 or clouds > 70:
+        return "poor"
+    if clouds <= 25 and rain_chance < 20 and wind_mph < 15:
+        return "great"
+    return "okay"
+
+
+def get_night_forecast(location: str, nights: int = 7) -> str:
+    """Hour-by-hour sky conditions between sunset and sunrise for the next few nights."""
+    nights = max(1, min(nights, 14))
     try:
         place = geocode(location)
-        current = requests.get(
+        forecast = requests.get(
             FORECAST_URL,
             params={
                 "latitude": place["latitude"],
                 "longitude": place["longitude"],
-                "current": "temperature_2m,relative_humidity_2m,wind_speed_10m",
+                "hourly": "cloud_cover,precipitation_probability,temperature_2m,wind_speed_10m",
+                "daily": "sunrise,sunset",
+                "timezone": "auto",
+                "forecast_days": nights + 1,  # the last night ends on the morning after
                 "temperature_unit": "fahrenheit",
                 "wind_speed_unit": "mph",
             },
             timeout=10,
-        ).json()["current"]
+        ).json()
+        hourly, daily = forecast["hourly"], forecast["daily"]
     except LookupError as e:
         return json.dumps({"error": str(e)})
-    except requests.RequestException as e:
+    except (requests.RequestException, KeyError) as e:
         # The model cannot see an exception. Return something it can reason about.
-        return json.dumps({"error": f"Weather service failed: {e}"})
+        return json.dumps({"error": f"Weather service failed: {e}. Try again in a moment."})
 
-    return json.dumps({
-        "location": place["name"],
-        "temp_f": current["temperature_2m"],
-        "humidity": current["relative_humidity_2m"],
-        "wind_mph": current["wind_speed_10m"],
-    })
+    hours = [
+        {
+            "time": datetime.fromisoformat(t),
+            "clouds": hourly["cloud_cover"][i],
+            "rain_chance": hourly["precipitation_probability"][i] or 0,
+            "temp_f": hourly["temperature_2m"][i],
+            "wind_mph": hourly["wind_speed_10m"][i],
+        }
+        for i, t in enumerate(hourly["time"])
+    ]
+
+    results = []
+    for day in range(nights):
+        # Dark enough for planets starts about an hour after sunset and ends an hour before sunrise.
+        dark_start = datetime.fromisoformat(daily["sunset"][day]) + timedelta(hours=1)
+        dark_end = datetime.fromisoformat(daily["sunrise"][day + 1]) - timedelta(hours=1)
+        night = [h for h in hours if dark_start <= h["time"] <= dark_end and h["clouds"] is not None]
+        if not night:
+            continue
+
+        for h in night:
+            h["rating"] = _rate_hour(h["clouds"], h["rain_chance"], h["wind_mph"])
+        good = [h for h in night if h["rating"] != "poor"]
+        great = [h for h in night if h["rating"] == "great"]
+
+        results.append({
+            "night_of": daily["sunset"][day][:10],
+            "weekday": f"{dark_start:%A}",
+            "rating": "great" if len(great) >= 3 else "okay" if len(good) >= 3 else "poor",
+            "dark_from": f"{dark_start:%-I:%M %p}",
+            "dark_until": f"{dark_end:%-I:%M %p}",
+            "avg_cloud_cover_pct": round(sum(h["clouds"] for h in night) / len(night)),
+            "max_rain_chance_pct": max(h["rain_chance"] for h in night),
+            "low_temp_f": round(min(h["temp_f"] for h in night)),
+            "max_wind_mph": round(max(h["wind_mph"] for h in night)),
+            "clear_hours": [f"{h['time']:%-I %p}" for h in good],
+        })
+
+    return json.dumps({"location": place["name"], "nights": results})
 
 
 def _horizons_command(name: str) -> str:
@@ -216,8 +286,94 @@ def get_visible_objects(location: str, objects: list[str] | None = None, night: 
     return json.dumps({
         "location": place["name"],
         "night_of": evening.isoformat(),
+        "weekday": f"{evening:%A}",
         "objects": results,
     })
+
+
+def _miles_and_direction(lat1: float, lon1: float, lat2: float, lon2: float) -> tuple[int, str]:
+    """Straight-line miles between two points, and the compass direction from the first to the second."""
+    p1, p2, dlon = math.radians(lat1), math.radians(lat2), math.radians(lon2 - lon1)
+    a = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+    miles = 3959 * 2 * math.asin(math.sqrt(a))
+    bearing = math.degrees(math.atan2(
+        math.sin(dlon) * math.cos(p2),
+        math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dlon),
+    )) % 360
+    return round(miles), COMPASS[round(bearing / 22.5) % 16]
+
+
+def get_light_pollution(city: str, state: str | None = None) -> str:
+    """Look up a US city's light pollution score and the nearest place with a dark sky."""
+    if not state and "," in city:
+        city, state = (part.strip() for part in city.split(",", 1))
+    city = city.strip()
+
+    db = sqlite3.connect(LIGHT_POLLUTION_DB)
+    db.row_factory = sqlite3.Row
+    columns = "name, state, state_name, lat, lon, zone, lpi_low, lpi_high, score, population"
+    # The exact name, plus names that start with it ("Nashville" -> "Nashville-Davidson", "Boise" -> "Boise City").
+    matches = db.execute(
+        f"SELECT {columns} FROM places WHERE name = ? COLLATE NOCASE OR name LIKE ? OR name LIKE ? OR name LIKE ?",
+        (city, f"{city}-%", f"{city}/%", f"{city} City"),
+    ).fetchall()
+    if state:
+        matches = [m for m in matches if state.lower() in (m["state"].lower(), m["state_name"].lower())]
+
+    if not matches:
+        db.close()
+        where = f" in {state}" if state else ""
+        return json.dumps({"error": (
+            f"'{city}'{where} is not in the database, which covers US cities and towns, including Puerto Rico. "
+            "Check the spelling, or try the nearest larger city."
+        )})
+
+    # Several places share a name (there are dozens of Springfields). Prefer a big city;
+    # if none is big, ask which state.
+    big = [m for m in matches if m["population"]]
+    if len(matches) > 1 and not big:
+        db.close()
+        states = sorted({m["state_name"] for m in matches})
+        return json.dumps({"error": (
+            f"There are {len(matches)} places called '{city}', in: {', '.join(states[:15])}. "
+            "Ask the user which state, then call again with the state."
+        )})
+    place = max(big, key=lambda m: m["population"]) if big else matches[0]
+
+    result = {
+        "place": f"{place['name']}, {place['state']}",
+        "score": place["score"],
+        "score_scale": "1 (pristine dark sky) to 10 (brightest inner city)",
+        "atlas_zone": place["zone"],
+        "city_glow_vs_natural_sky": (
+            f"{place['lpi_low']}x to {place['lpi_high']}x" if place["lpi_high"] else f"over {place['lpi_low']}x"
+        ),
+        "what_you_can_see": SKY_BY_SCORE[place["score"]],
+    }
+
+    if place["score"] > DARK_SKY_SCORE:
+        # Nearest dark place: search a box around the city first, then widen if it comes up empty.
+        for box in (3, 8, 30):
+            candidates = db.execute(
+                "SELECT name, state, lat, lon, score FROM places "
+                "WHERE score <= ? AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?",
+                (DARK_SKY_SCORE, place["lat"] - box, place["lat"] + box, place["lon"] - box, place["lon"] + box),
+            ).fetchall()
+            if candidates:
+                break
+        if candidates:
+            nearest = min(candidates, key=lambda c: _miles_and_direction(place["lat"], place["lon"], c["lat"], c["lon"])[0])
+            miles, direction = _miles_and_direction(place["lat"], place["lon"], nearest["lat"], nearest["lon"])
+            result["nearest_dark_sky"] = {
+                "place": f"{nearest['name']}, {nearest['state']}",
+                "score": nearest["score"],
+                "miles_away": miles,
+                "direction": direction,
+                "what_you_can_see": SKY_BY_SCORE[nearest["score"]],
+            }
+    db.close()
+    result["source"] = "2025 World Atlas of Artificial Night Sky Brightness (David Lorenz), US Census places"
+    return json.dumps(result)
 
 
 # What the model sees: the "set notes" in the screenplay.
@@ -225,12 +381,21 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_weather",
-            "description": "Get the current weather (temperature, humidity, wind) for a city.",
+            "name": "get_night_forecast",
+            "description": (
+                "Get the stargazing weather for a city from Open-Meteo: for each upcoming night, the dark "
+                "hours, average cloud cover, chance of rain, low temperature, wind, an overall rating "
+                "(great, okay or poor) and which hours are clear enough to observe. Use it whenever the "
+                "user asks if they can go out tonight or which night this week is best."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "location": {"type": "string", "description": "City name, e.g. 'New York'"},
+                    "location": {"type": "string", "description": "City name, e.g. 'New York' or 'Paris, Texas'"},
+                    "nights": {
+                        "type": "integer",
+                        "description": "How many nights to forecast, starting tonight. 1 for just tonight. Default 7, max 14.",
+                    },
                 },
                 "required": ["location"],
             },
@@ -269,10 +434,39 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_light_pollution",
+            "description": (
+                "Look up how light polluted a US city or town is (including Puerto Rico), from a database "
+                "built on the 2025 light pollution atlas. Returns a score from 1 (pristine dark sky) to 10 "
+                "(brightest inner city), how many times brighter the city glow is than a natural night sky, "
+                "what a beginner can expect to see there, and, if the sky is bright, the nearest town with a "
+                "dark sky (miles and compass direction). Use it when the user asks how dark their sky is, "
+                "why they can't see much, or where to go for a darker sky."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "US city or town name, e.g. 'Chicago' or 'Springfield'"},
+                    "state": {
+                        "type": "string",
+                        "description": "State name or two-letter code, e.g. 'IL'. Needed when several towns share the name.",
+                    },
+                },
+                "required": ["city"],
+            },
+        },
+    },
 ]
 
 # What the harness runs: tool name -> Python function.
-TOOL_MAP = {"get_weather": get_weather, "get_visible_objects": get_visible_objects}
+TOOL_MAP = {
+    "get_night_forecast": get_night_forecast,
+    "get_visible_objects": get_visible_objects,
+    "get_light_pollution": get_light_pollution,
+}
 
 
 def run_tool(name: str, args: dict) -> str:
